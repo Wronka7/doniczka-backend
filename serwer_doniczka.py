@@ -14,7 +14,7 @@ def get_db_connection():
     return conn
 
 # ==========================================
-#  INICJALIZACJA BAZY DANYCH
+# INICJALIZACJA BAZY DANYCH
 # ==========================================
 def init_db():
     conn = get_db_connection()
@@ -27,11 +27,12 @@ def init_db():
             name TEXT NOT NULL,
             species TEXT,
             planted_date TEXT,
-            target_moisture REAL DEFAULT 35.0,
+            moisture_start REAL DEFAULT 25.0,
+            moisture_stop REAL DEFAULT 40.0,
             notes TEXT
         )
     ''')
-
+    
     # Tabela z historią pomiarów
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS Measurements_History (
@@ -45,13 +46,13 @@ def init_db():
             FOREIGN KEY (plant_id) REFERENCES Plants (id)
         )
     ''')
-
+    
     # Domyślny wiersz dla pierwszej rośliny (jeśli baza jest pusta)
     cursor.execute("SELECT COUNT(*) FROM Plants")
     if cursor.fetchone()[0] == 0:
         cursor.execute('''
-            INSERT INTO Plants (id, name, species, planted_date, target_moisture, notes)
-            VALUES (1, 'Moja Pierwsza Roślina', 'Monstera', '2026-05-01', 35.0, 'Roślina w salonie')
+            INSERT INTO Plants (id, name, species, planted_date, moisture_start, moisture_stop, notes)
+            VALUES (1, 'Moja Pierwsza Roślina', 'Monstera', '2026-05-01', 25.0, 40.0, 'Roślina w salonie')
         ''')
     
     conn.commit()
@@ -60,7 +61,7 @@ def init_db():
 init_db()
 
 # ==========================================
-#  ENDPOINTY DLA ARDUINO / ESP
+# ENDPOINTY DLA ARDUINO / ESP
 # ==========================================
 
 # 1. Zapis pojedynczego pomiaru na żywo
@@ -88,6 +89,7 @@ def log_measurement():
     print(f"[LIVE] Roślina ID={plant_id} | Temp: {temp}°C | Wilgotność: {moisture}% | Woda OK: {water_ok} | Pompa: {pump_status}")
     return jsonify({"status": "success", "message": "Pomiar zapisany"}), 201
 
+
 # 2. Zbiórka danych z karty MicroSD (tryb offline/sync)
 @app.route('/bulk_log', methods=['POST'])
 def bulk_log():
@@ -98,7 +100,7 @@ def bulk_log():
     logs = data['logs']
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     count = 0
     for log in logs:
         plant_id = log.get('plant_id', 1)
@@ -120,12 +122,13 @@ def bulk_log():
     print(f"[SD-SYNC] Zsynchronizowano {count} zaległych pomiarów z karty SD!")
     return jsonify({"status": "success", "message": f"Pomyślnie zsynchronizowano {count} wpisów"}), 201
 
-# 3. Pobieganie konfiguracji progu podlewania przez Arduino
+
+# 3. Pobieranie konfiguracji progów podawania wody dla Arduino (POPRAWIONE)
 @app.route('/plant/<int:plant_id>/config', methods=['GET'])
 def get_plant_config(plant_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    plant = cursor.execute("SELECT id, target_moisture FROM Plants WHERE id = ?", (plant_id,)).fetchone()
+    plant = cursor.execute("SELECT id, moisture_start, moisture_stop FROM Plants WHERE id = ?", (plant_id,)).fetchone()
     conn.close()
 
     if plant is None:
@@ -134,11 +137,13 @@ def get_plant_config(plant_id):
     return jsonify({
         "status": "success",
         "plant_id": plant['id'],
-        "target_moisture": plant['target_moisture']
+        "moisture_start": plant['moisture_start'],
+        "moisture_stop": plant['moisture_stop']
     }), 200
 
+
 # ==========================================
-#  ENDPOINTY DLA APLIKACJI MOBILNEJ / TELEFONU
+# ENDPOINTY DLA APLIKACJI MOBILNEJ / TELEFONU
 # ==========================================
 
 # 4. Pobranie listy wszystkich roślin
@@ -150,6 +155,7 @@ def get_plants():
     conn.close()
     return jsonify([dict(p) for p in plants]), 200
 
+
 # 5. Pobranie historii pomiarów dla danej rośliny (np. ostatnie 20)
 @app.route('/measurements/<int:plant_id>', methods=['GET'])
 def get_measurements(plant_id):
@@ -157,14 +163,15 @@ def get_measurements(plant_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     rows = cursor.execute('''
-        SELECT * FROM Measurements_History 
-        WHERE plant_id = ? 
+        SELECT * FROM Measurements_History
+        WHERE plant_id = ?
         ORDER BY timestamp DESC LIMIT ?
     ''', (plant_id, limit)).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows]), 200
 
-# 6. Edycja/Ustawienie nowej rośliny lub zmiany progu wilgotności z telefonu
+
+# 6. Edycja/Ustawienie nowej rośliny lub zmiany progów wilgotności z telefonu
 @app.route('/plant/settings', methods=['POST'])
 def update_plant_settings():
     data = request.get_json()
@@ -172,7 +179,8 @@ def update_plant_settings():
         return jsonify({"status": "error", "message": "Wymagane 'plant_id'"}), 400
 
     plant_id = data['plant_id']
-    target_moisture = data.get('target_moisture')
+    moisture_start = data.get('moisture_start')
+    moisture_stop = data.get('moisture_stop')
     name = data.get('name')
     species = data.get('species')
     planted_date = data.get('planted_date')
@@ -180,8 +188,10 @@ def update_plant_settings():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    if target_moisture is not None:
-        cursor.execute("UPDATE Plants SET target_moisture = ? WHERE id = ?", (target_moisture, plant_id))
+    if moisture_start is not None:
+        cursor.execute("UPDATE Plants SET moisture_start = ? WHERE id = ?", (moisture_start, plant_id))
+    if moisture_stop is not None:
+        cursor.execute("UPDATE Plants SET moisture_stop = ? WHERE id = ?", (moisture_stop, plant_id))
     if name is not None:
         cursor.execute("UPDATE Plants SET name = ? WHERE id = ?", (name, plant_id))
     if species is not None:
@@ -197,12 +207,11 @@ def update_plant_settings():
 
 
 # ==========================================
-#  URUCHOMIENIE SERWERA
+# URUCHOMIENIE SERWERA
 # ==========================================
 if __name__ == '__main__':
-    # Pobiera port ze środowiska chmury (domyślnie 5000 lokalnie)
     port = int(os.environ.get('PORT', 5000))
-    print("==================================================")
-    print(f" SERWER WI-FI / CLOUD DLA DONICZKI NA PORTU {port}")
-    print("==================================================")
+    print("==========================================")
+    print(f"SERWER WI-FI / CLOUD DLA DONICZKI NA PORTU {port}")
+    print("==========================================")
     app.run(host='0.0.0.0', port=port, debug=True)
