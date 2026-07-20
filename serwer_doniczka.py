@@ -4,6 +4,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
+app.json.ensure_ascii = False
 CORS(app)  # Zezwala na połączenia z aplikacji mobilnej / PWA
 
 DATABASE = 'doniczka.db'
