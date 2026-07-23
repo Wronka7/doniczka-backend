@@ -4,7 +4,7 @@ import sqlite3
 from flask import Flask, g, jsonify, request, send_file
 
 app = Flask(__name__)
-
+app.json.ensure_ascii = False
 # Baza danych (na Renderze zap pisoana będzie w katalogu domyślnym, u Ciebie lokalnie)
 DATABASE = "doniczka.db"
 
