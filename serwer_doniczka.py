@@ -1,218 +1,142 @@
+from datetime import datetime
 import os
 import sqlite3
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask import Flask, g, jsonify, request, send_file
 
 app = Flask(__name__)
-app.json.ensure_ascii = False
-CORS(app)  # Zezwala na połączenia z aplikacji mobilnej / PWA
 
-DATABASE = 'doniczka.db'
+# Baza danych (na Renderze zap pisoana będzie w katalogu domyślnym, u Ciebie lokalnie)
+DATABASE = "doniczka.db"
 
-def get_db_connection():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
 
-# ==========================================
-# INICJALIZACJA BAZY DANYCH
-# ==========================================
+def get_db():
+  db = getattr(g, "_database", None)
+  if db is None:
+    db = g._database = sqlite3.connect(DATABASE)
+    db.row_factory = sqlite3.Row
+  return db
+
+
+@app.teardown_appcontext
+def close_connection(exception):
+  db = getattr(g, "_database", None)
+  if db is not None:
+    db.close()
+
+
+# Inicjalizacja tabel (tworzy je, jeśli nie istnieją)
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Tabela z konfiguracją roślin
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS Plants (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            species TEXT,
-            planted_date TEXT,
-            moisture_start REAL DEFAULT 25.0,
-            moisture_stop REAL DEFAULT 40.0,
-            notes TEXT
-        )
-    ''')
-    
-    # Tabela z historią pomiarów
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS Measurements_History (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            plant_id INTEGER DEFAULT 1,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            temperature REAL,
-            moisture REAL,
-            water_level_ok BOOLEAN,
-            pump_status TEXT,
-            FOREIGN KEY (plant_id) REFERENCES Plants (id)
-        )
-    ''')
-    
-    # Domyślny wiersz dla pierwszej rośliny (jeśli baza jest pusta)
-    cursor.execute("SELECT COUNT(*) FROM Plants")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute('''
-            INSERT INTO Plants (id, name, species, planted_date, moisture_start, moisture_stop, notes)
-            VALUES (1, 'Moja Pierwsza Roślina', 'Monstera', '2026-05-01', 25.0, 40.0, 'Roślina w salonie')
-        ''')
-    
-    conn.commit()
-    conn.close()
+  with app.app_context():
+    db = get_db()
+    db.execute("""
+            CREATE TABLE IF NOT EXISTS Measurements_History (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                temperature REAL,
+                moisture REAL,
+                water_level_ok INTEGER,
+                pump_status TEXT,
+                plant_id INTEGER
+            )
+        """)
+    db.commit()
+
 
 init_db()
 
-# ==========================================
-# ENDPOINTY DLA ARDUINO / ESP
-# ==========================================
 
-# 1. Zapis pojedynczego pomiaru na żywo
-@app.route('/log', methods=['POST'])
+# 1. Endpoint do odbierania pomiarów z mikrokontrolera (POST)
+@app.route("/log", methods=["POST"])
 def log_measurement():
-    data = request.get_json()
-    if not data:
-        return jsonify({"status": "error", "message": "Brak danych JSON"}), 400
+  data = request.json
+  if not data:
+    return jsonify({"error": "Brak danych JSON"}), 400
 
-    plant_id = data.get('plant_id', 1)
-    temp = data.get('temperature')
-    moisture = data.get('moisture')
-    water_ok = data.get('water_level_ok')
-    pump_status = data.get('pump_status', 'NIEZNANY')
+  plant_id = data.get("plant_id", 1)
+  temperature = data.get("temperature")
+  moisture = data.get("moisture")
+  water_level_ok = 1 if data.get("water_level_ok") else 0
+  pump_status = data.get("pump_status", "WYŁĄCZONA")
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO Measurements_History (plant_id, temperature, moisture, water_level_ok, pump_status)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (plant_id, temp, moisture, water_ok, pump_status))
-    conn.commit()
-    conn.close()
+  # Pobranie aktualnego czasu serwera
+  timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    print(f"[LIVE] Roślina ID={plant_id} | Temp: {temp}°C | Wilgotność: {moisture}% | Woda OK: {water_ok} | Pompa: {pump_status}")
-    return jsonify({"status": "success", "message": "Pomiar zapisany"}), 201
+  db = get_db()
+  db.execute(
+      """
+        INSERT INTO Measurements_History (timestamp, temperature, moisture, water_level_ok, pump_status, plant_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """,
+      (
+          timestamp,
+          temperature,
+          moisture,
+          water_level_ok,
+          pump_status,
+          plant_id,
+      ),
+  )
+  db.commit()
 
-
-# 2. Zbiórka danych z karty MicroSD (tryb offline/sync)
-@app.route('/bulk_log', methods=['POST'])
-def bulk_log():
-    data = request.get_json()
-    if not data or 'logs' not in data:
-        return jsonify({"status": "error", "message": "Wymagane pole 'logs'"}), 400
-
-    logs = data['logs']
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    count = 0
-    for log in logs:
-        plant_id = log.get('plant_id', 1)
-        timestamp = log.get('timestamp')
-        temp = log.get('temperature')
-        moisture = log.get('moisture')
-        water_ok = log.get('water_level_ok')
-        pump_status = log.get('pump_status', 'NIEZNANY')
-
-        cursor.execute('''
-            INSERT INTO Measurements_History (plant_id, timestamp, temperature, moisture, water_level_ok, pump_status)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (plant_id, timestamp, temp, moisture, water_ok, pump_status))
-        count += 1
-
-    conn.commit()
-    conn.close()
-
-    print(f"[SD-SYNC] Zsynchronizowano {count} zaległych pomiarów z karty SD!")
-    return jsonify({"status": "success", "message": f"Pomyślnie zsynchronizowano {count} wpisów"}), 201
+  return jsonify({"status": "sukces", "zapisano_czas": timestamp}), 201
 
 
-# 3. Pobieranie konfiguracji progów podawania wody dla Arduino (POPRAWIONE)
-@app.route('/plant/<int:plant_id>/config', methods=['GET'])
-def get_plant_config(plant_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    plant = cursor.execute("SELECT id, moisture_start, moisture_stop FROM Plants WHERE id = ?", (plant_id,)).fetchone()
-    conn.close()
+# 2. NOWOŚĆ: Endpoint do pobierania WSZYSTKICH pomiarów bez filtrowania po ID kwiatka
+@app.route("/measurements", methods=["GET"])
+def get_all_measurements():
+  db = get_db()
+  cursor = db.execute(
+      "SELECT * FROM Measurements_History ORDER BY id DESC"
+  )  # Najnowsze na górze
+  rows = cursor.fetchall()
 
-    if plant is None:
-        return jsonify({"status": "error", "message": "Nie znaleziono rośliny"}), 404
+  result = []
+  for row in rows:
+    result.append({
+        "id": row["id"],
+        "timestamp": row["timestamp"],
+        "temperature": row["temperature"],
+        "moisture": row["moisture"],
+        "water_level_ok": row["water_level_ok"],
+        "pump_status": row["pump_status"],
+        "plant_id": row["plant_id"],
+    })
 
-    return jsonify({
-        "status": "success",
-        "plant_id": plant['id'],
-        "moisture_start": plant['moisture_start'],
-        "moisture_stop": plant['moisture_stop']
-    }), 200
-
-
-# ==========================================
-# ENDPOINTY DLA APLIKACJI MOBILNEJ / TELEFONU
-# ==========================================
-
-# 4. Pobranie listy wszystkich roślin
-@app.route('/plants', methods=['GET'])
-def get_plants():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    plants = cursor.execute("SELECT * FROM Plants").fetchall()
-    conn.close()
-    return jsonify([dict(p) for p in plants]), 200
+  return jsonify(result)
 
 
-# 5. Pobranie historii pomiarów dla danej rośliny (np. ostatnie 20)
-@app.route('/measurements/<int:plant_id>', methods=['GET'])
-def get_measurements(plant_id):
-    limit = request.args.get('limit', 20)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    rows = cursor.execute('''
-        SELECT * FROM Measurements_History
-        WHERE plant_id = ?
-        ORDER BY timestamp DESC LIMIT ?
-    ''', (plant_id, limit)).fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in rows]), 200
+# 3. Stary endpoint z filtrowaniem po ID (zostawiamy, jakby był potrzebny)
+@app.route("/measurements/<int:plant_id>", methods=["GET"])
+def get_measurements_by_plant(plant_id):
+  db = get_db()
+  cursor = db.execute(
+      "SELECT * FROM Measurements_History WHERE plant_id = ? ORDER BY id DESC",
+      (plant_id,),
+  )
+  rows = cursor.fetchall()
+
+  result = []
+  for row in rows:
+    result.append({
+        "id": row["id"],
+        "timestamp": row["timestamp"],
+        "temperature": row["temperature"],
+        "moisture": row["moisture"],
+        "water_level_ok": row["water_level_ok"],
+        "pump_status": row["pump_status"],
+        "plant_id": row["plant_id"],
+    })
+
+  return jsonify(result)
 
 
-# 6. Edycja/Ustawienie nowej rośliny lub zmiany progów wilgotności z telefonu
-@app.route('/plant/settings', methods=['POST'])
-def update_plant_settings():
-    data = request.get_json()
-    if not data or 'plant_id' not in data:
-        return jsonify({"status": "error", "message": "Wymagane 'plant_id'"}), 400
-
-    plant_id = data['plant_id']
-    moisture_start = data.get('moisture_start')
-    moisture_stop = data.get('moisture_stop')
-    name = data.get('name')
-    species = data.get('species')
-    planted_date = data.get('planted_date')
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    if moisture_start is not None:
-        cursor.execute("UPDATE Plants SET moisture_start = ? WHERE id = ?", (moisture_start, plant_id))
-    if moisture_stop is not None:
-        cursor.execute("UPDATE Plants SET moisture_stop = ? WHERE id = ?", (moisture_stop, plant_id))
-    if name is not None:
-        cursor.execute("UPDATE Plants SET name = ? WHERE id = ?", (name, plant_id))
-    if species is not None:
-        cursor.execute("UPDATE Plants SET species = ? WHERE id = ?", (species, plant_id))
-    if planted_date is not None:
-        cursor.execute("UPDATE Plants SET planted_date = ? WHERE id = ?", (planted_date, plant_id))
-
-    conn.commit()
-    conn.close()
-
-    print(f"[API MOBILNE] Zaktualizowano ustawienia dla rośliny ID={plant_id}")
-    return jsonify({"status": "success", "message": "Ustawienia zaktualizowane"}), 200
+# 4. NOWOŚĆ: Przycisk / funkcja do pobierania pliku bazy danych na Twój komputer!
+@app.route("/download-db", methods=["GET"])
+def download_database():
+  if os.path.exists(DATABASE):
+    return send_file(DATABASE, as_attachment=True)
+  return "Baza danych jeszcze nie istnieje!", 404
 
 
-# ==========================================
-# URUCHOMIENIE SERWERA
-# ==========================================
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    print("==========================================")
-    print(f"SERWER WI-FI / CLOUD DLA DONICZKI NA PORTU {port}")
-    print("==========================================")
-    app.run(host='0.0.0.0', port=port, debug=True)
+if __name__ == "__main__":
+  app.run(host="0.0.0.0", port=5000, debug=True)
