@@ -5,8 +5,10 @@ from flask import Flask, g, jsonify, request, send_file
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
-# Baza danych (na Renderze zap pisoana będzie w katalogu domyślnym, u Ciebie lokalnie)
-DATABASE = "doniczka.db"
+import os
+
+# Bezpieczna ścieżka dla bazy danych zapobiegająca resetowaniu
+DATABASE = os.path.join(os.path.expanduser("~"), "doniczka.db")
 
 
 def get_db():
